@@ -1,0 +1,39 @@
+name: FANY Ticket Watch
+
+on:
+  schedule:
+    # 30分おきにチェック（UTC基準。必要に応じて調整してください）
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Check FANY ticket
+        run: node scripts/check-fany.js
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_TO_ID: ${{ secrets.LINE_TO_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+
+      - name: Commit updated state
+        run: |
+          git config user.name "fany-watch-bot"
+          git config user.email "actions@github.com"
+          git add data/fany-state.json
+          git diff --quiet --cached || git commit -m "Update FANY ticket state [skip ci]"
+          git push

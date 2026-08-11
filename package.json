@@ -1,0 +1,14 @@
+{
+  "name": "fany-watch",
+  "version": "1.0.0",
+  "description": "FANYチケットに新しい公演が追加されたらLINE通知＋Googleカレンダー登録する",
+  "type": "commonjs",
+  "scripts": {
+    "check": "node scripts/check-fany.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "googleapis": "^144.0.0"
+  }
+}
