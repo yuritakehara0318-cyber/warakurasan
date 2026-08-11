@@ -22,6 +22,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Install Chrome dependencies for Puppeteer
+        run: npx puppeteer browsers install chrome
+
       - name: Check FANY ticket
         run: node scripts/check-fany.js
         env:
