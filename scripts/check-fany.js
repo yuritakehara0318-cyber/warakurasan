@@ -13,6 +13,7 @@ const path = require('path');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
+const puppeteer = require('puppeteer');
 
 const COMEDIANS_PATH = path.join(__dirname, '../config/comedians.json');
 const STATE_PATH = path.join(__dirname, '../data/fany-state.json');
@@ -35,9 +36,7 @@ function makeId(str) {
   return crypto.createHash('md5').update(str).digest('hex');
 }
 
-// 見出しテキスト（例: "2026/08/10(月)開場 14:30 開演 15:00真夏の！アロハ寄席 in WWホールCOOL JAPAN PARK OSAKA WWホール（大阪府）"）
-// から日付・開演時刻・タイトルをざっくり抜き出す。
-// サイト側の表記ゆれで多少ズレることがあるので、失敗したら見出しそのものをタイトルとして使う。
+// 見出しテキストから日付・開演時刻・タイトルをざっくり抜き出す。
 function parseHeading(raw) {
   const text = raw.replace(/\s+/g, ' ').trim();
   const dateMatch = text.match(/(\d{4})\/(\d{2})\/(\d{2})/);
@@ -45,7 +44,6 @@ function parseHeading(raw) {
   const venueMatch = text.match(/（([^）]+)）\s*$/);
 
   let title = text;
-  // 日付・開場・開演の接頭部分を取り除く
   title = title.replace(/^\d{4}\/\d{2}\/\d{2}\([^)]+\)(\s*[～〜]\s*\d{4}\/\d{2}\/\d{2}\([^)]+\))?\s*/, '');
   title = title.replace(/開場\s*\d{2}:\d{2}\s*/, '');
   title = title.replace(/開演\s*\d{2}:\d{2}\s*/, '');
@@ -62,24 +60,52 @@ function parseHeading(raw) {
   };
 }
 
-async function fetchEventsFor(name) {
+// ブラウザで検索ページを開き、「もっと見る」ボタンが無くなるまでクリックして
+// 全件を読み込んだ状態のHTMLを取得する。
+async function fetchFullHtml(browser, name) {
   const url = `${SEARCH_BASE}?keywords=${encodeURIComponent(name)}&search_type=search_string`;
-  const res = await axios.get(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; fany-watch/1.0)' },
-    timeout: 20000,
-  });
-  const $ = cheerio.load(res.data);
+  const page = await browser.newPage();
+  await page.setUserAgent('Mozilla/5.0 (compatible; fany-watch/1.0)');
+
+  try {
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    for (let i = 0; i < 30; i++) {
+      const clicked = await page.evaluate(() => {
+        const candidates = Array.from(document.querySelectorAll('button, a, div, span'));
+        const moreBtn = candidates.find(
+          (el) => el.textContent && el.textContent.trim() === 'もっと見る'
+        );
+        if (moreBtn) {
+          moreBtn.scrollIntoView();
+          moreBtn.click();
+          return true;
+        }
+        return false;
+      });
+      if (!clicked) break;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    const html = await page.content();
+    return html;
+  } finally {
+    await page.close();
+  }
+}
+
+async function fetchEventsFor(browser, name) {
+  const html = await fetchFullHtml(browser, name);
+  const $ = cheerio.load(html);
 
   const events = [];
   const seen = new Set();
 
-  // 詳細/申込リンク（/reception/xxx/yyy）を起点に、直近の見出しを探して1公演とみなす。
   $('a[href*="/reception/"]').each((_, el) => {
     const $el = $(el);
     const href = $el.attr('href');
     if (!href) return;
 
-    // 近くの見出し要素（h1〜h4）をDOM上で遡って探す
     let heading = '';
     let node = $el.closest('article, section, li, div, tr');
     for (let i = 0; i < 4 && node && node.length; i++) {
@@ -96,7 +122,7 @@ async function fetchEventsFor(name) {
       node = node.parent();
     }
 
-    if (!heading) return; // 見出しが取れなかったものはスキップ（誤検知防止）
+    if (!heading) return;
 
     const parsed = parseHeading(heading);
     const id = makeId(`${name}::${heading}`);
@@ -175,7 +201,7 @@ async function addToGoogleCalendar(events) {
     if (e.startTime) {
       const startDateTime = `${e.dateStr}T${e.startTime}:00+09:00`;
       const [h, m] = e.startTime.split(':').map(Number);
-      const endH = (h + 2) % 24; // 終演時刻不明なので開演の2時間後を仮置き
+      const endH = (h + 2) % 24;
       const endDateTime = `${e.dateStr}T${String(endH).padStart(2, '0')}:${String(m).padStart(2, '0')}:00+09:00`;
       start = { dateTime: startDateTime, timeZone: 'Asia/Tokyo' };
       end = { dateTime: endDateTime, timeZone: 'Asia/Tokyo' };
@@ -208,26 +234,37 @@ async function main() {
 
   const newEvents = [];
 
-  for (const name of comedians) {
-    console.log(`検索中: ${name}`);
-    let events = [];
-    try {
-      events = await fetchEventsFor(name);
-    } catch (err) {
-      console.error(`取得失敗 (${name}):`, err.message);
-      continue;
-    }
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
 
-    if (!state[name]) state[name] = [];
-    const known = new Set(state[name]);
-
-    for (const e of events) {
-      if (!known.has(e.id)) {
-        newEvents.push(e);
-        known.add(e.id);
+  try {
+    for (const name of comedians) {
+      console.log(`検索中: ${name}`);
+      let events = [];
+      try {
+        events = await fetchEventsFor(browser, name);
+      } catch (err) {
+        console.error(`取得失敗 (${name}):`, err.message);
+        continue;
       }
+
+      console.log(`  ${events.length}件取得`);
+
+      if (!state[name]) state[name] = [];
+      const known = new Set(state[name]);
+
+      for (const e of events) {
+        if (!known.has(e.id)) {
+          newEvents.push(e);
+          known.add(e.id);
+        }
+      }
+      state[name] = Array.from(known);
     }
-    state[name] = Array.from(known);
+  } finally {
+    await browser.close();
   }
 
   if (newEvents.length === 0) {
